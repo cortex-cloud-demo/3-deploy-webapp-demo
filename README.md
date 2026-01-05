@@ -1,6 +1,7 @@
 # Deploy WebApp Demo (CloudLabs)
 
-![GitOps Application Deployment Status](https://img.shields.io/github/actions/workflow/status/cortex-cloud-demo/3-deploy-webapp-demo/kustomize.yaml?branch=main&label=CI/CD&logo=github&style=flat-square)
+![GitOps Application Deployment Status](https://img.shields.io/github/actions/workflow/status/cortex-cloud-demo/3-deploy-webapp-demo/kustomize.yaml?branch=main&label=GitOps%20Application%20Deployment%20Status&logo=github&style=flat-square)
+
 
 This repository contains the Kubernetes manifests and Kustomize configuration for deploying a demo version of the **CloudLabs WebApp**. It’s tailored for GitOps workflows using **ArgoCD**, and supports dynamic Docker image tagging.
 

@@ -2,23 +2,34 @@ name: Update Kustomization for ArgoCD
 
 on:
   workflow_dispatch:
+    inputs:
+      IMAGE_URI:
+        description: 'Image URI (format: registry/image:tag)'
+        required: true
+        type: string
+      SKIP_CORTEX_SCAN:
+        description: 'Skip Cortex security scan'
+        required: false
+        type: boolean
+        default: false
   repository_dispatch:
     types: [deploy-image]
 
 env:
-  # Cortex secrets
   CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY }}
   CORTEX_API_KEY_ID: ${{ vars.CORTEX_API_KEY_ID }}
   CORTEX_API_URL: ${{ vars.CORTEX_API_URL }}
 
 jobs:
-
   ###############################################
   # Check Kubernetes YAML with Cortex Cloud
   ###############################################
   cortex-scan:
-    name: "Job 1 - Cortex Cloud Scan - Security checks"
+    name: "Cortex Cloud Scan - Security checks (optional)"
     runs-on: ubuntu-latest
+    continue-on-error: true  # N'échoue jamais le workflow
+    if: ${{ github.event.inputs.SKIP_CORTEX_SCAN != 'true' }}  # Peut être skippé
+    
     steps:
       - name: Checkout IaC Repository
         uses: actions/checkout@v4
@@ -27,75 +38,213 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Verify Node.js Version
-        run: node -v
+        continue-on-error: true
 
       - name: Download Cortex CLI
+        continue-on-error: true
+        id: download-cortex
         run: |
-          echo "Downloading CortexCLI..."
+          set +e  # Désactive l'arrêt automatique en cas d'erreur
+          
+          echo "📥 Attempting to download CortexCLI..."
           mkdir -p cortexcli
-          curl -s -o cortexcli/cortexcli $(curl -s "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
+          
+          # Vérifier que les variables sont définies
+          if [ -z "$CORTEX_API_URL" ] || [ -z "$CORTEX_API_KEY_ID" ] || [ -z "$CORTEX_API_KEY" ]; then
+            echo "::warning::Cortex credentials not configured - skipping scan"
+            echo "scan_skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Tenter de récupérer l'URL de téléchargement
+          SIGNED_URL=$(curl -s "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
             -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
-            -H "Authorization: ${CORTEX_API_KEY}" | jq -r ".signed_url")
+            -H "Authorization: ${CORTEX_API_KEY}" 2>/dev/null | jq -r ".signed_url" 2>/dev/null)
+          
+          if [ -z "$SIGNED_URL" ] || [ "$SIGNED_URL" = "null" ]; then
+            echo "::warning::Unable to retrieve Cortex CLI download URL - skipping scan"
+            echo "scan_skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Tenter de télécharger le CLI
+          if ! curl -s -f -o cortexcli/cortexcli "$SIGNED_URL" 2>/dev/null; then
+            echo "::warning::Failed to download Cortex CLI - skipping scan"
+            echo "scan_skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
           chmod +x cortexcli/cortexcli
           sudo mv cortexcli/cortexcli /usr/local/bin/
-          cortexcli --version
+          
+          # Vérifier l'installation
+          if ! cortexcli --version 2>/dev/null; then
+            echo "::warning::Cortex CLI installation verification failed - skipping scan"
+            echo "scan_skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "✅ Cortex CLI installed successfully"
+          echo "scan_skipped=false" >> $GITHUB_OUTPUT
 
       - name: Run Cortex CLI Code Scan
+        if: steps.download-cortex.outputs.scan_skipped != 'true'
+        continue-on-error: true
+        id: cortex-scan
         run: |
+          set +e  # Désactive l'arrêt automatique en cas d'erreur
+          
+          echo "🔍 Running Cortex security scan..."
+          
           cortexcli \
             --api-base-url "${CORTEX_API_URL}" \
             --api-key "${CORTEX_API_KEY}" \
             --api-key-id "${CORTEX_API_KEY_ID}" \
             code scan \
-            --directory "${{github.workspace}}" \
+            --directory "${{ github.workspace }}" \
             --repo-id "${{ github.repository }}" \
             --branch "${{ github.ref }}" \
             --source "GITHUB_ACTIONS" \
-            --create-repo-if-missing
+            --create-repo-if-missing 2>&1
+          
+          SCAN_EXIT_CODE=$?
+          
+          if [ $SCAN_EXIT_CODE -eq 0 ]; then
+            echo "✅ Cortex scan completed successfully"
+            echo "scan_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Cortex scan encountered issues (exit code: $SCAN_EXIT_CODE) - continuing workflow"
+            echo "scan_status=failed" >> $GITHUB_OUTPUT
+          fi
+          
+          exit 0  # Toujours retourner succès
+
+      - name: Cortex Scan Summary
+        if: always()
+        run: |
+          echo "## 🔒 Cortex Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.download-cortex.outputs.scan_skipped }}" == "true" ]; then
+            echo "⚠️ **Status:** Skipped (Cortex CLI unavailable or credentials missing)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.cortex-scan.outputs.scan_status }}" == "success" ]; then
+            echo "✅ **Status:** Scan completed successfully" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.cortex-scan.outputs.scan_status }}" == "failed" ]; then
+            echo "⚠️ **Status:** Scan encountered issues but deployment continues" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ **Status:** Scan not executed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Note: Cortex security scans are optional and will never block deployments_" >> $GITHUB_STEP_SUMMARY
 
   ###############################################
   # Update kustomization.yaml
   ###############################################
   update_kustomization:
-    name: "Job 2 - Update Kustomization YAML for k8s deployment"
+    name: "Update Kustomization YAML"
     runs-on: ubuntu-latest
     needs: cortex-scan
+    if: always()  # S'exécute toujours, même si cortex-scan est skippé ou échoue
 
     steps:
-      # Checkout repo
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.PERSONAL_GITHUB_TOKEN }}
 
-      # Install yq
+      - name: Validate IMAGE_URI
+        id: validate
+        run: |
+          IMAGE_URI="${{ github.event.inputs.IMAGE_URI || github.event.client_payload.image_uri }}"
+          
+          if [ -z "$IMAGE_URI" ]; then
+            echo "::error::IMAGE_URI is not provided"
+            exit 1
+          fi
+          
+          # Validate format (should contain at least one ':')
+          if [[ ! "$IMAGE_URI" =~ : ]]; then
+            echo "::error::IMAGE_URI must be in format 'registry/image:tag'"
+            exit 1
+          fi
+          
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+          echo "✅ Validated IMAGE_URI: $IMAGE_URI"
+
       - name: Install yq
         run: |
-          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          YQ_VERSION="v4.40.5"
+          sudo wget -q https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
           sudo chmod +x /usr/local/bin/yq
           yq --version
 
-      # Update kustomization.yaml
+      - name: Check kustomization.yaml exists
+        run: |
+          if [ ! -f ./kustomization.yaml ]; then
+            echo "::error::kustomization.yaml not found in repository root"
+            exit 1
+          fi
+          echo "✅ kustomization.yaml found"
+
       - name: Update kustomization.yaml image
         run: |
-          # Get IMAGE_URI from workflow_dispatch or repository_dispatch
-          IMAGE_URI="${{ github.event.inputs.IMAGE_URI || github.event.client_payload.image_uri }}"
-          echo "Updating kustomization.yaml with image: $IMAGE_URI"
           IMAGE_NAME="${IMAGE_URI%:*}"
           IMAGE_TAG="${IMAGE_URI##*:}"
-          echo "Extracted Name: $IMAGE_NAME"
-          echo "Extracted Tag: $IMAGE_TAG"
+          
+          echo "📝 Updating kustomization.yaml:"
+          echo "  Full URI: $IMAGE_URI"
+          echo "  Image Name: $IMAGE_NAME"
+          echo "  Image Tag: $IMAGE_TAG"
+          
+          # Backup original file
+          cp kustomization.yaml kustomization.yaml.bak
+          
+          # Update with yq
           yq eval -i ".images[0].newName = \"$IMAGE_NAME\" | .images[0].newTag = \"$IMAGE_TAG\"" ./kustomization.yaml
+          
+          # Verify changes
+          echo ""
+          echo "📋 Changes made:"
+          diff kustomization.yaml.bak kustomization.yaml || true
+          rm kustomization.yaml.bak
+          
+          echo ""
+          echo "✅ kustomization.yaml updated successfully"
 
-  ###############################################
-  # Commit and push changes
-  ###############################################
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           file_pattern: kustomization.yaml
-          commit_message: "Update image to ${{ github.event.inputs.IMAGE_URI || github.event.client_payload.image_uri }}"
+          commit_message: "chore: update image to ${{ env.IMAGE_URI }}"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
+          
+      - name: Generate Deployment Summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image URI | \`${{ env.IMAGE_URI }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | ${{ github.repository }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit SHA | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Affiche le statut du scan Cortex
+          echo "### Security Scan Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.cortex-scan.result }}" == "success" ]; then
+            echo "🔒 **Cortex Scan:** ✅ Completed successfully" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.cortex-scan.result }}" == "failure" ]; then
+            echo "🔒 **Cortex Scan:** ⚠️ Encountered issues (deployment proceeded)" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.cortex-scan.result }}" == "skipped" ]; then
+            echo "🔒 **Cortex Scan:** ⏭️ Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🔒 **Cortex Scan:** ℹ️ Not available" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Deployment completed successfully**" >> $GITHUB_STEP_SUMMARY

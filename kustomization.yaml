@@ -6,5 +6,5 @@ resources:
 # Dynamically set the Docker image name and tag
 images:
   - name: IMAGE_PLACEHOLDER # Matches placeholder in deployment.yaml
-    newName: "985869370198.dkr.ecr.eu-west-3.amazonaws.com/k8slab-chrisley75-ecr-4fz" # Can be changed dynamically
-    newTag: "build-13" # Can be updated via CI/CD
+    newName: "985869370198.dkr.ecr.us-east-1.amazonaws.com/k1s-chrisley75-ecr-mri" # Can be changed dynamically
+    newTag: "build-14" # Can be updated via CI/CD
